@@ -20,16 +20,50 @@ import concurrent.futures
 from common import Config, check_path_safety, get_resource_path
 
 
+_VIDEO_IMPORT_ERROR = ""
+
+
 def get_video_file_clip_class():
+    global _VIDEO_IMPORT_ERROR
+    errors = []
     try:
         from moviepy.editor import VideoFileClip
+        _VIDEO_IMPORT_ERROR = ""
         return VideoFileClip
-    except Exception:
-        try:
-            from moviepy import VideoFileClip
-            return VideoFileClip
-        except Exception:
-            return None
+    except Exception as exc:
+        errors.append(f"moviepy.editor: {exc}")
+
+    try:
+        from moviepy.video.io.VideoFileClip import VideoFileClip
+        _VIDEO_IMPORT_ERROR = ""
+        return VideoFileClip
+    except Exception as exc:
+        errors.append(f"moviepy.video.io.VideoFileClip: {exc}")
+
+    _VIDEO_IMPORT_ERROR = " | ".join(errors)
+    return None
+
+
+def get_video_dependency_error():
+    return _VIDEO_IMPORT_ERROR or "moviepy is not available"
+
+
+def validate_video_dependencies():
+    VideoFileClip = get_video_file_clip_class()
+    if VideoFileClip is None:
+        raise RuntimeError(get_video_dependency_error())
+
+    try:
+        import imageio_ffmpeg
+
+        ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as exc:
+        raise RuntimeError(f"imageio_ffmpeg: {exc}") from exc
+
+    if not os.path.exists(ffmpeg_path):
+        raise RuntimeError(f"ffmpeg executable is missing: {ffmpeg_path}")
+
+    return True
 
 
 HAS_MOVIEPY = get_video_file_clip_class() is not None
@@ -846,7 +880,12 @@ class VideoSettingsDialog(tk.Toplevel):
     def load_preview_and_init(self):
         VideoFileClip = get_video_file_clip_class()
         if VideoFileClip is None:
-            messagebox.showerror("错误", "处理视频需要安装 moviepy 库！\n请运行对应 venv 的 pip install moviepy")
+            messagebox.showerror(
+                "错误",
+                "处理视频需要安装或打包 moviepy 库！\n"
+                f"{get_video_dependency_error()}\n"
+                "请更新到已修复的视频依赖版本。",
+            )
             self.destroy()
             return
         try:
@@ -1549,7 +1588,12 @@ class BuffPage(tk.Frame):
         ext = os.path.splitext(p)[1].lower()
         if ext in ['.mp4', '.avi', '.webm', '.mov', '.gif', '.mkv']:
             if not HAS_MOVIEPY:
-                messagebox.showerror("错误", "处理视频需要安装 moviepy 库！\n请运行: pip install moviepy")
+                messagebox.showerror(
+                    "错误",
+                    "处理视频需要安装或打包 moviepy 库！\n"
+                    f"{get_video_dependency_error()}\n"
+                    "请更新到已修复的视频依赖版本。",
+                )
                 return
             
             self.temp_video_path = p 

@@ -1,5 +1,6 @@
 import importlib.util
 from pathlib import Path
+import subprocess
 import sys
 import unittest
 
@@ -13,6 +14,18 @@ class VideoSupportTest(unittest.TestCase):
         expected = importlib.util.find_spec("moviepy") is not None
 
         self.assertEqual(mod_buff.HAS_MOVIEPY, expected)
+
+    def test_video_dependency_smoke_command_passes(self):
+        launcher = Path(__file__).resolve().parents[1] / "single_page_launcher.py"
+
+        result = subprocess.run(
+            [sys.executable, str(launcher), "--smoke-video-deps"],
+            timeout=5,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
 
 
 if __name__ == "__main__":
