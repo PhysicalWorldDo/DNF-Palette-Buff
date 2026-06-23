@@ -545,92 +545,90 @@ class VideoSettingsDialog(tk.Toplevel):
 
 # 1. 定义职业对照数据 (直接嵌入代码，方便调用)
 BUFF_MAPPING_SRC = """
-男鬼剑士
-03mghost_buf_asura——阿修罗
-03mghost_buf_bsk——狂战士
-03mghost_buf_ghost——剑影
-03mghost_buf_soul——鬼泣
-03mghost_buf_wep——剑魂
-女鬼剑
-(TN)fgs_buf_blade3——刃影
-(TN)fgs_buf_demon3——剑魔
-fgs_buf_darktemp3——暗帝
-fgs_buf_swordma3——剑宗
-fgs_buf_vega3——剑帝
-女格斗家
-(TN)05Ffighter_buf_grap——柔道家(女)
-05Ffighter_buf_nen——气功师(女)
-05Ffighter_buf_street——街霸(女)
-05Ffighter_buf_strik——散打(女)
-男格斗家
-02mfigher_buf_grap——柔道家(男)
-02mfigher_buf_nen——气功师(男)
-02mfigher_buf_Street——街霸(男)
-02mfighter_buf_strik——散打(男)
-男神枪手
-04mgunner_buf_assult——合金战士
-04mgunner_buf_luncher——枪炮师(男)
-04mgunner_buf_meca——机械师(男)
-04mgunner_buf_ranger——漫游枪手(男)
-04mgunner_buf_spit——弹药专家(男)
-女神枪手
-(TN)11Fgunner_buf_launcher——枪炮师(女)
-11Fgunner_buf_meca——机械师(女)
-11Fgunner_buf_ranger——漫游枪手(女)
-11Fgunner_buf_spit——弹药专家(女)
-11Fgunner_buf_paramedic——协战师(女)
-男魔法师
-10Mmage_buf_bloodm——血法师
-10Mmage_buf_dimension——次元行者
-10Mmage_buf_elbomber——元素爆破师
-10Mmage_buf_glancial——冰结师
-10Mmage_buf_swiftma——逐风者
-女魔法师
-07fmage_buf_battlemage——战斗法师
-07fmage_buf_element——元素师
-07fmage_buf_enchant——小魔女
-07fmage_buf_summoner——召唤师
-07fmage_buf_witch——魔道学者
-男圣职者
-06Mprist_buf_avenger——复仇者
-06Mprist_buf_battlecru——圣骑士(审判)
-06Mprist_buf_buffcru——圣骑士(奶爸)
-06Mprist_buf_exorcist——驱魔师
-06Mprist_buf_infight——蓝拳圣使
-女圣职者
-(TN)08Fpriest_buf_sorcer——驱魔师
-08Fpriest_buf_crusager——光明骑士
-08Fpriest_buf_inquis——正义审判者
-08Fpriest_buf_mistress——除恶者
-暗夜使者
-(TN)09thief_buf_necro——黑夜术士
-(TN)09thief_buf_rogue——暗星
-09thief_buf_kuno——忍者
-09thief_buf_shadow——影舞者
-守护者
-(TN)12knight_buf_chaos——混沌魔灵
-(TN)12knight_buf_dragonkn——龙骑士
-12knight_buf_eleven——精灵骑士
-12knight_buf_paladin——帕拉丁
+鬼剑士
+01_ghost_M_buf_asura.bk2——阿修罗
+01_ghost_M_buf_bsk.bk2——狂战士
+01_ghost_M_buf_ghost.bk2——剑影
+01_ghost_M_buf_soul.bk2——鬼泣
+01_ghost_M_buf_wep.bk2——剑魂
+02_ghost_F_buf_blade.bk2——刃影
+02_ghost_F_buf_demon.bk2——剑魔
+02_ghost_F_buf_darktemp.bk2——暗帝
+02_ghost_F_buf_sword.bk2——剑宗
+02_ghost_F_buf_vega.bk2——剑帝
+格斗家
+04_fighter_F_buf_grap.bk2——柔道家(女)
+04_fighter_F_buf_nen.bk2——气功师(女)
+04_fighter_F_buf_street.bk2——街霸(女)
+04_fighter_F_buf_strik.bk2——散打(女)
+03_figher_M_buf_grap.bk2——柔道家(男)
+03_figher_M_buf_nen.bk2——气功师(男)
+03_figher_M_buf_Street.bk2——街霸(男)
+03_figher_M_buf_strik.bk2——散打(男)
+魔法师
+07_mage_M_buf_bloodm.bk2——血法师
+07_mage_M_buf_dimension.bk2——次元行者
+07_mage_M_buf_elbomber.bk2——元素爆破师
+07_mage_M_buf_glancial.bk2——冰结师
+07_mage_M_buf_swiftma.bk2——逐风者
+08_mage_F_buf_battlemage.bk2——战斗法师
+08_mage_F_buf_element.bk2——元素师
+08_mage_F_buf_enchant.bk2——小魔女
+08_mage_F_buf_summoner.bk2——召唤师
+08_mage_F_buf_witch.bk2——魔道学者
+神枪手
+05_gunner_M_buf_assult.bk2——合金战士
+05_gunner_M_buf_luncher.bk2——枪炮师(男)
+05_gunner_M_buf_meca.bk2——机械师(男)
+05_gunner_M_buf_ranger.bk2——漫游枪手(男)
+05_gunner_M_buf_spit.bk2——弹药专家(男)
+06_gunner_F_buf_launcher.bk2——枪炮师(女)
+06_gunner_F_buf_meca.bk2——机械师(女)
+06_gunner_F_buf_ranger.bk2——漫游枪手(女)
+06_gunner_F_buf_spit.bk2——弹药专家(女)
+06_gunner_F_buf_paramedic.bk2——协战师
+圣职者
+09_prist_M_buf_avenger.bk2——复仇者
+09_prist_M_buf_battlecru.bk2——圣骑士(审判)
+09_prist_M_buf_buffcru.bk2——圣骑士(奶爸)
+09_prist_M_buf_exorcist.bk2——驱魔师
+09_prist_M_buf_infight.bk2——蓝拳圣使(男)
+10_priest_F_buf_sorcer.bk2——巫女
+10_priest_F_buf_crusager.bk2——圣骑士(女)
+10_priest_F_buf_inquis.bk2——异端审判者
+10_priest_F_buf_mistress.bk2——诱魔者
+10_priest_F_buf_infigh——蓝拳圣使(女)
+暗夜
+11_thief_buf_necro.bk2——暗夜使者
+11_thief_buf_rogue.bk2——刺客
+11_thief_buf_kuno.bk2——忍者
+11_thief_buf_shadow.bk2——影舞者
 魔枪士
-13demolancer_buf_darklancer——暗枪士
-13demolancer_buf_dralancer——狩猎者
-13demolancer_buf_duelist——决战者
-13demolancer_buf_vanguard——征战者
+14_demolancer_buf_darklancer.bk2——暗枪士
+14_demolancer_buf_dralancer.bk2——狩猎者
+14_demolancer_buf_duelist.bk2——决战者
+14_demolancer_buf_vanguard.bk2——征战者
+守护者
+12_knight_buf_chaos.bk2——混沌魔灵
+12_knight_buf_dragonkn.bk2——龙骑士
+12_knight_buf_eleven.bk2——精灵骑士
+12_knight_buf_paladin.bk2——帕拉丁
 枪剑士
-14GunBla_buf_agent——特工
-14GunBla_buf_hitman——暗刃
-14GunBla_buf_specilist——源能专家
-14GunBla_buf_trouble——战线佣兵
+15_GunBla_buf_agent.bk2——特工
+15_GunBla_buf_hitman.bk2——暗刃
+15_GunBla_buf_specilist.bk2——源能专家
+15_GunBla_buf_trouble.bk2——战线佣兵
 弓箭手
-(TN)17archer_buf_hunter——猎人
-(TN)17archer_buf_vigil——妖护使
-17archer_buf_muse——缪斯
-17archer_buf_traveler——旅人
-(TN)17archer_buf_chimera——奇美拉
-外传职业
-15darkknight_buf——黑暗武士
-(TN)16Creater_buf——缔造者
+16_archer_buf_hunter.bk2——猎人
+16_archer_buf_vigil.bk2——妖护使
+16_archer_buf_muse.bk2——缪斯
+16_archer_buf_traveler.bk2——旅人
+16_archer_buf_chimera.bk2——奇美拉
+外传
+13_ECT_darkknight_buf.bk2——黑暗武士
+13_ECT_Creater_buf.bk2——缔造者
+帝国骑士
+17_imperial_F_buf_break——破浪者
 """
 
 # =========================================================================
@@ -849,8 +847,11 @@ def parse_buff_data():
         if not line: continue
         if "——" in line:
             code, name = line.split("——", 1)
+            code = code.strip()
+            if code.lower().endswith(".bk2"):
+                code = code[:-4]
             if current_cat:
-                data[current_cat][name.strip()] = code.strip()
+                data[current_cat][name.strip()] = code
         else:
             current_cat = line
             data[current_cat] = {}
