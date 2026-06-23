@@ -20,7 +20,75 @@ import concurrent.futures
 from common import Config, check_path_safety, get_resource_path
 
 
-HAS_MOVIEPY = True
+def get_video_file_clip_class():
+    try:
+        from moviepy.editor import VideoFileClip
+        return VideoFileClip
+    except Exception:
+        try:
+            from moviepy import VideoFileClip
+            return VideoFileClip
+        except Exception:
+            return None
+
+
+HAS_MOVIEPY = get_video_file_clip_class() is not None
+
+PREVIEW_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp")
+
+
+def _frame_sort_key(path):
+    name = os.path.basename(path)
+    digits = "".join(filter(str.isdigit, name))
+    return (int(digits) if digits else 0, name.lower())
+
+
+def collect_preview_frames(source_path):
+    if not source_path:
+        return []
+
+    if os.path.isdir(source_path):
+        frames = glob.glob(os.path.join(source_path, "frame_*.png"))
+        if not frames:
+            frames = [
+                os.path.join(source_path, name)
+                for name in os.listdir(source_path)
+                if os.path.splitext(name)[1].lower() in PREVIEW_IMAGE_EXTENSIONS
+            ]
+        return [os.path.abspath(path) for path in sorted(frames, key=_frame_sort_key)]
+
+    if os.path.isfile(source_path):
+        ext = os.path.splitext(source_path)[1].lower()
+        if ext in PREVIEW_IMAGE_EXTENSIONS:
+            return [os.path.abspath(source_path)]
+
+    return []
+
+
+def is_bink_file(path):
+    if not path or not os.path.isfile(path):
+        return False
+    try:
+        with open(path, "rb") as f:
+            header = f.read(4)
+    except OSError:
+        return False
+    return header.startswith(b"BIK") or header.startswith(b"KB2")
+
+
+def resolve_preview_target(generated_file, processed_path):
+    if generated_file and os.path.exists(generated_file):
+        if is_bink_file(generated_file):
+            return "bink", os.path.abspath(generated_file)
+
+    frames = collect_preview_frames(processed_path)
+    if frames:
+        return "frames", frames
+
+    if generated_file and os.path.exists(generated_file):
+        return "invalid_bink", os.path.abspath(generated_file)
+
+    return "missing", generated_file
 
 
 # --- 核心构建函数 ---
@@ -115,6 +183,11 @@ def build_hidden_bk2(image_folder, output_bk2, tool_path, status_callback=None):
         
         
 class EffectFactory:
+    EFFECT_MODES = ("简单 Cut-in", "噪声光环", "秘法火光", "花瓣消散", "无")
+
+    @staticmethod
+    def available_effects():
+        return list(EffectFactory.EFFECT_MODES)
 
     # --- 工具: 缓动函数 ---
     
@@ -127,6 +200,19 @@ class EffectFactory:
     @staticmethod
     def _ease_in_expo(t):
         return 0.0 if t == 0.0 else math.pow(2.0, 10.0 * (t - 1.0))
+
+    @staticmethod
+    def _smoothstep(edge0, edge1, x):
+        t = np.clip((x - edge0) / (edge1 - edge0), 0.0, 1.0)
+        return t * t * (3.0 - 2.0 * t)
+
+    @staticmethod
+    def _fract(x):
+        return x - np.floor(x)
+
+    @staticmethod
+    def _mix(a, b, t):
+        return a * (1.0 - t) + b * t
 
     # --- 工具: 左右渐变蒙版 (常驻) ---
     @staticmethod
@@ -154,6 +240,355 @@ class EffectFactory:
             
         mask_2d = np.tile(base_line, (h, 1))
         return Image.fromarray(mask_2d.astype(np.uint8), mode="L")
+
+    @staticmethod
+    def _paste_clipped(canvas, image, x, y):
+        left = max(0, x)
+        top = max(0, y)
+        right = min(canvas.width, x + image.width)
+        bottom = min(canvas.height, y + image.height)
+        if right <= left or bottom <= top:
+            return
+
+        crop_box = (left - x, top - y, right - x, bottom - y)
+        cropped = image.crop(crop_box)
+        canvas.paste(cropped, (left, top), cropped)
+
+    @staticmethod
+    def _scale_rgba(image, scale):
+        if abs(scale - 1.0) < 0.001:
+            return image
+
+        new_w = max(1, int(round(image.width * scale)))
+        new_h = max(1, int(round(image.height * scale)))
+        return image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+    @staticmethod
+    def _multiply_alpha(image, factor):
+        if factor >= 0.999:
+            return image
+
+        result = image.copy()
+        r, g, b, a = result.split()
+        a_arr = np.array(a).astype(float)
+        a_arr = np.clip(a_arr * max(0.0, min(1.0, factor)), 0, 255)
+        result.putalpha(Image.fromarray(a_arr.astype(np.uint8), mode="L"))
+        return result
+
+    @staticmethod
+    def _paste_centered(canvas, image, offset_x=0, offset_y=0, scale=1.0, alpha=1.0):
+        image = EffectFactory._scale_rgba(image, scale)
+        image = EffectFactory._multiply_alpha(image, alpha)
+        paste_x = (canvas.width - image.width) // 2 + int(offset_x)
+        paste_y = (canvas.height - image.height) // 2 + int(offset_y)
+        EffectFactory._paste_clipped(canvas, image, paste_x, paste_y)
+
+    @staticmethod
+    def _apply_side_fade(canvas, side_mask_arr):
+        if side_mask_arr is None:
+            return canvas
+
+        r, g, b, a = canvas.split()
+        a_arr = np.array(a).astype(float)
+        new_a_arr = (a_arr * side_mask_arr) / 255.0
+        canvas.putalpha(Image.fromarray(new_a_arr.astype(np.uint8), mode="L"))
+        return canvas
+
+    @staticmethod
+    def _shader_uv(size):
+        w, h = size
+        y_grid, x_grid = np.mgrid[0:h, 0:w]
+        uv_x = ((x_grid + 0.5) * 2.0 - w) / max(1.0, float(h))
+        uv_y = (h - (y_grid + 0.5) * 2.0) / max(1.0, float(h))
+        return uv_x.astype(float), uv_y.astype(float)
+
+    @staticmethod
+    def _alpha_bounds(image):
+        bbox = image.split()[3].getbbox()
+        if bbox:
+            return bbox
+        return (0, 0, image.width, image.height)
+
+    @staticmethod
+    def _rect_border_fields(size, bounds=None, inset_ratio=0.025):
+        w, h = size
+        y_grid, x_grid = np.mgrid[0:h, 0:w]
+        if bounds is None:
+            bounds = (0, 0, w, h)
+
+        raw_left, raw_top, raw_right, raw_bottom = bounds
+        bounds_w = max(1.0, float(raw_right - raw_left))
+        bounds_h = max(1.0, float(raw_bottom - raw_top))
+        min_dim = max(1.0, float(min(bounds_w, bounds_h)))
+        inset_px = min_dim * inset_ratio
+        left = raw_left + inset_px
+        right = raw_right - inset_px
+        top = raw_top + inset_px
+        bottom = raw_bottom - inset_px
+        if right <= left:
+            left, right = raw_left, raw_right
+        if bottom <= top:
+            top, bottom = raw_top, raw_bottom
+        cx = (left + right) * 0.5
+        cy = (top + bottom) * 0.5
+        half_w = (right - left) * 0.5
+        half_h = (bottom - top) * 0.5
+
+        qx = np.abs((x_grid + 0.5) - cx) - half_w
+        qy = np.abs((y_grid + 0.5) - cy) - half_h
+        outside = np.sqrt(np.maximum(qx, 0.0) ** 2 + np.maximum(qy, 0.0) ** 2)
+        inside = np.minimum(np.maximum(qx, qy), 0.0)
+        signed_dist = outside + inside
+        border_dist = np.abs(signed_dist) / min_dim
+
+        d_left = np.abs((x_grid + 0.5) - left)
+        d_right = np.abs((x_grid + 0.5) - right)
+        d_top = np.abs((y_grid + 0.5) - top)
+        d_bottom = np.abs((y_grid + 0.5) - bottom)
+        nearest = np.argmin(np.stack([d_top, d_right, d_bottom, d_left]), axis=0)
+
+        top_phase = np.clip(((x_grid + 0.5) - left) / max(1.0, right - left), 0.0, 1.0)
+        right_phase = 1.0 + np.clip(((y_grid + 0.5) - top) / max(1.0, bottom - top), 0.0, 1.0)
+        bottom_phase = 2.0 + np.clip((right - (x_grid + 0.5)) / max(1.0, right - left), 0.0, 1.0)
+        left_phase = 3.0 + np.clip((bottom - (y_grid + 0.5)) / max(1.0, bottom - top), 0.0, 1.0)
+        phase = np.choose(nearest, [top_phase, right_phase, bottom_phase, left_phase]) / 4.0
+        return border_dist, phase
+
+    @staticmethod
+    def _hash33(x, y, z):
+        x = EffectFactory._fract(x * 0.1031)
+        y = EffectFactory._fract(y * 0.11369)
+        z = EffectFactory._fract(z * 0.13787)
+        dot_value = x * (y + 19.19) + y * (x + 19.19) + z * (z + 19.19)
+        x = x + dot_value
+        y = y + dot_value
+        z = z + dot_value
+        return (
+            -1.0 + 2.0 * EffectFactory._fract((x + y) * z),
+            -1.0 + 2.0 * EffectFactory._fract((x + z) * y),
+            -1.0 + 2.0 * EffectFactory._fract((y + z) * x),
+        )
+
+    @staticmethod
+    def _snoise3(x, y, z):
+        k1 = 0.333333333
+        k2 = 0.166666667
+
+        i_x = np.floor(x + (x + y + z) * k1)
+        i_y = np.floor(y + (x + y + z) * k1)
+        i_z = np.floor(z + (x + y + z) * k1)
+        i_sum = i_x + i_y + i_z
+
+        d0_x = x - (i_x - i_sum * k2)
+        d0_y = y - (i_y - i_sum * k2)
+        d0_z = z - (i_z - i_sum * k2)
+
+        e_x = (d0_x - d0_y >= 0.0).astype(float)
+        e_y = (d0_y - d0_z >= 0.0).astype(float)
+        e_z = (d0_z - d0_x >= 0.0).astype(float)
+
+        i1_x = e_x * (1.0 - e_z)
+        i1_y = e_y * (1.0 - e_x)
+        i1_z = e_z * (1.0 - e_y)
+        i2_x = 1.0 - e_z * (1.0 - e_x)
+        i2_y = 1.0 - e_x * (1.0 - e_y)
+        i2_z = 1.0 - e_y * (1.0 - e_z)
+
+        d1_x = d0_x - (i1_x - k2)
+        d1_y = d0_y - (i1_y - k2)
+        d1_z = d0_z - (i1_z - k2)
+        d2_x = d0_x - (i2_x - k1)
+        d2_y = d0_y - (i2_y - k1)
+        d2_z = d0_z - (i2_z - k1)
+        d3_x = d0_x - 0.5
+        d3_y = d0_y - 0.5
+        d3_z = d0_z - 0.5
+
+        h0 = np.maximum(0.6 - (d0_x * d0_x + d0_y * d0_y + d0_z * d0_z), 0.0)
+        h1 = np.maximum(0.6 - (d1_x * d1_x + d1_y * d1_y + d1_z * d1_z), 0.0)
+        h2 = np.maximum(0.6 - (d2_x * d2_x + d2_y * d2_y + d2_z * d2_z), 0.0)
+        h3 = np.maximum(0.6 - (d3_x * d3_x + d3_y * d3_y + d3_z * d3_z), 0.0)
+
+        g0 = EffectFactory._hash33(i_x, i_y, i_z)
+        g1 = EffectFactory._hash33(i_x + i1_x, i_y + i1_y, i_z + i1_z)
+        g2 = EffectFactory._hash33(i_x + i2_x, i_y + i2_y, i_z + i2_z)
+        g3 = EffectFactory._hash33(i_x + 1.0, i_y + 1.0, i_z + 1.0)
+
+        n0 = h0**4 * (d0_x * g0[0] + d0_y * g0[1] + d0_z * g0[2])
+        n1 = h1**4 * (d1_x * g1[0] + d1_y * g1[1] + d1_z * g1[2])
+        n2 = h2**4 * (d2_x * g2[0] + d2_y * g2[1] + d2_z * g2[2])
+        n3 = h3**4 * (d3_x * g3[0] + d3_y * g3[1] + d3_z * g3[2])
+        return 31.316 * (n0 + n1 + n2 + n3)
+
+    @staticmethod
+    def _extract_alpha(color):
+        max_value = np.clip(color.max(axis=2), 0.0, 1.0)
+        safe = max_value > 1e-5
+        rgb = np.zeros_like(color)
+        rgb[safe] = color[safe] / max_value[safe, None]
+
+        rgba = np.zeros((*max_value.shape, 4), dtype=np.uint8)
+        rgba[:, :, :3] = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
+        rgba[:, :, 3] = np.clip(max_value * 255.0, 0, 255).astype(np.uint8)
+        return Image.fromarray(rgba, mode="RGBA")
+
+    @staticmethod
+    def _noise_halo_layer(size, time_value, bounds=None):
+        w, h = size
+        border_dist, phase = EffectFactory._rect_border_fields(size, bounds=bounds)
+        n0 = EffectFactory._snoise3(phase * 4.2, border_dist * 13.0, np.full((h, w), time_value * 0.5)) * 0.5 + 0.5
+        noise_width = EffectFactory._mix(0.018, 0.04, n0)
+        v0 = 1.0 / (1.0 + border_dist * 70.0)
+        v0 *= EffectFactory._smoothstep(noise_width * 2.4, 0.0, border_dist)
+        cl = np.cos(phase * math.tau + time_value * 2.0) * 0.5 + 0.5
+
+        moving = EffectFactory._fract(0.16 - time_value * 0.18)
+        phase_delta = np.abs(EffectFactory._fract(phase - moving + 0.5) - 0.5)
+        v1 = 1.5 / (1.0 + phase_delta * phase_delta * 700.0 + border_dist * 90.0)
+        v2 = EffectFactory._smoothstep(0.085, 0.0, border_dist)
+        v3 = EffectFactory._smoothstep(0.052, 0.0, border_dist)
+
+        color1 = np.array([0.611765, 0.262745, 0.996078])
+        color2 = np.array([0.298039, 0.760784, 0.913725])
+        color3 = np.array([0.062745, 0.078431, 0.600000])
+        color_mix = color1 * (1.0 - cl[:, :, None]) + color2 * cl[:, :, None]
+        col = color3 * (1.0 - v0[:, :, None]) + color_mix * v0[:, :, None]
+        col = (col + v1[:, :, None]) * v2[:, :, None] * v3[:, :, None]
+        col = np.clip(col * 1.8, 0.0, 1.0)
+        return EffectFactory._extract_alpha(col)
+
+    @staticmethod
+    def _triwave(x):
+        return np.abs(EffectFactory._fract(0.5 * x / math.pi - 0.25) - 0.5) * 4.0 - 1.0
+
+    @staticmethod
+    def _arcane_fire_layer(size, time_value, bounds=None):
+        w, h = size
+        border_dist, phase = EffectFactory._rect_border_fields(size, bounds=bounds)
+        c = np.cos(time_value * 1.35)
+        s = np.sin(time_value * 1.35)
+        qx = phase * 4.0 * c - border_dist * 12.0 * s
+        qy = phase * 4.0 * s + border_dist * 12.0 * c
+        qz = np.full_like(qx, time_value * 0.6)
+        for d in range(2, 9):
+            wave = EffectFactory._triwave(qx * d + qy * 0.75 + time_value * 2.0)
+            qx = qx + EffectFactory._triwave(qy * d + qz + time_value) / d
+            qy = qy + EffectFactory._triwave(qz * d + wave + time_value * 1.7) / d
+
+        wobble = np.sin(phase * math.tau * 9.0 - time_value * 4.5 + qx * 2.0 + qy * 1.4)
+        edge = border_dist
+        flame = np.exp(-edge * 36.0) * (0.65 + 0.35 * wobble)
+        flame += np.exp(-(edge * 58.0) ** 2) * 1.55
+        flame += np.exp(-np.abs(edge - (0.028 + 0.012 * wobble)) * 42.0) * 0.5
+        flame = np.clip(flame, 0.0, 1.7)
+
+        orange = np.array([1.0, 0.38, 0.04])
+        yellow = np.array([1.0, 0.86, 0.25])
+        violet = np.array([0.38, 0.12, 0.72])
+        hot = np.clip(flame, 0.0, 1.0)
+        col = orange * (1.0 - hot[:, :, None]) + yellow * hot[:, :, None]
+        col = col + violet * (np.maximum(0.0, 0.35 - edge)[:, :, None] * 0.45)
+        col *= np.clip(flame[:, :, None] * 1.15, 0.0, 1.0)
+        return EffectFactory._extract_alpha(np.clip(col, 0.0, 1.0))
+
+    @staticmethod
+    def _draw_petals(canvas, progress, bounds=None, count=38):
+        w, h = canvas.size
+        draw = ImageDraw.Draw(canvas, "RGBA")
+        if bounds is None:
+            bounds = (0, 0, w, h)
+        raw_left, raw_top, raw_right, raw_bottom = bounds
+        min_dim = max(1.0, float(min(raw_right - raw_left, raw_bottom - raw_top)))
+        inset_px = min_dim * 0.025
+        left = raw_left + inset_px
+        right = raw_right - inset_px
+        top = raw_top + inset_px
+        bottom = raw_bottom - inset_px
+        if right <= left:
+            left, right = raw_left, raw_right
+        if bottom <= top:
+            top, bottom = raw_top, raw_bottom
+        life = max(0.0, 1.0 - progress) ** 1.35
+
+        for idx in range(count):
+            rng = random.Random(12000 + idx * 131)
+            anchors = (
+                (left, top, -1.0, -1.0, 1.0, 0.0),
+                ((left + right) * 0.5, top, 0.0, -1.0, 1.0, 0.0),
+                (right, top, 1.0, -1.0, 0.0, 1.0),
+                (right, (top + bottom) * 0.5, 1.0, 0.0, 0.0, 1.0),
+                (right, bottom, 1.0, 1.0, -1.0, 0.0),
+                ((left + right) * 0.5, bottom, 0.0, 1.0, -1.0, 0.0),
+                (left, bottom, -1.0, 1.0, 0.0, -1.0),
+                (left, (top + bottom) * 0.5, -1.0, 0.0, 0.0, -1.0),
+            )
+            if idx < len(anchors):
+                base_x, base_y, normal_x, normal_y, tangent_x, tangent_y = anchors[idx]
+                normal_len = math.sqrt(normal_x * normal_x + normal_y * normal_y) or 1.0
+                normal_x /= normal_len
+                normal_y /= normal_len
+            else:
+                side = rng.randrange(4)
+                along = rng.random()
+                if side == 0:
+                    base_x = left + along * (right - left)
+                    base_y = top
+                    normal_x, normal_y = 0.0, -1.0
+                    tangent_x, tangent_y = 1.0, 0.0
+                elif side == 1:
+                    base_x = right
+                    base_y = top + along * (bottom - top)
+                    normal_x, normal_y = 1.0, 0.0
+                    tangent_x, tangent_y = 0.0, 1.0
+                elif side == 2:
+                    base_x = right - along * (right - left)
+                    base_y = bottom
+                    normal_x, normal_y = 0.0, 1.0
+                    tangent_x, tangent_y = -1.0, 0.0
+                else:
+                    base_x = left
+                    base_y = bottom - along * (bottom - top)
+                    normal_x, normal_y = -1.0, 0.0
+                    tangent_x, tangent_y = 0.0, -1.0
+
+            start_angle = math.atan2(normal_y, normal_x)
+            speed = 0.18 + rng.random() * 0.78
+            normal_distance = max(w, h) * progress * speed * 0.42
+            tangent_distance = math.sin(progress * math.tau * (0.55 + rng.random() * 0.9) + idx) * max(w, h) * 0.08 * progress
+            x = base_x + normal_x * normal_distance + tangent_x * tangent_distance + rng.uniform(-5, 5) * progress
+            y = base_y + normal_y * normal_distance + tangent_y * tangent_distance - h * 0.07 * progress + rng.uniform(-4, 4) * progress
+            size = (2.0 + rng.random() * 4.5) * (0.5 + life)
+            alpha = int((70 + rng.random() * 150) * life)
+            if alpha <= 0:
+                continue
+
+            color = rng.choice(((255, 92, 166), (255, 152, 205), (255, 218, 238), (215, 80, 255)))
+            rot = start_angle + progress * 5.0 + idx
+            p1 = (x + math.cos(rot) * size * 1.7, y + math.sin(rot) * size * 1.7)
+            p2 = (x + math.cos(rot + 1.7) * size, y + math.sin(rot + 1.7) * size)
+            p3 = (x - math.cos(rot) * size * 1.2, y - math.sin(rot) * size * 1.2)
+            p4 = (x + math.cos(rot - 1.7) * size, y + math.sin(rot - 1.7) * size)
+            draw.polygon((p1, p2, p3, p4), fill=(*color, alpha))
+
+        return canvas
+
+    @staticmethod
+    def _apply_petal_dissolve(canvas, frame_index, total_frames, bounds=None):
+        progress = frame_index / max(1, total_frames - 1)
+        result = canvas.copy()
+
+        if progress > 0.35:
+            amount = EffectFactory._smoothstep(0.35, 1.0, progress)
+            alpha = np.array(result.split()[3]).astype(float)
+            uv_x, uv_y = EffectFactory._shader_uv(result.size)
+            noise = EffectFactory._snoise3(uv_x * 3.2, uv_y * 3.2, np.full_like(uv_x, progress * 2.2)) * 0.5 + 0.5
+            keep = EffectFactory._smoothstep(amount - 0.16, amount + 0.06, noise)
+            result.putalpha(Image.fromarray(np.clip(alpha * keep, 0, 255).astype(np.uint8), mode="L"))
+
+        petals = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+        petal_progress = EffectFactory._smoothstep(0.12, 1.0, progress)
+        petals = EffectFactory._draw_petals(petals, petal_progress, bounds=bounds, count=42)
+        return Image.alpha_composite(result, petals)
 
     @staticmethod
     def generate(input_data, mode, frames=18):
@@ -196,9 +631,11 @@ class EffectFactory:
                 char_img = char_img.convert("RGBA")
 
             # --- 步骤 3: 计算位移 (核心动作) ---
+            offset_x = 0
             offset_y = 0
+            scale = 1.0
+            alpha = 1.0
             
-            # 【修复核心】只有选中特效模式时，才计算位移
             if mode == "简单 Cut-in":
                 if i < 4:
                     # [入场]: 从下往上冲
@@ -218,29 +655,33 @@ class EffectFactory:
                     offset_y = int(current_offset)
                 else:
                     offset_y = 0
-            else:
-                # 模式为 "无" 时，没有任何位移
-                offset_y = 0
 
             # --- 步骤 4: 绘制 ---
-            # X居中，Y居中+偏移
-            paste_x = (w - char_img.width) // 2
-            paste_y = (h - char_img.height) // 2 + offset_y
-            
-            # 粘贴 (保持透明底)
-            canvas.paste(char_img, (paste_x, paste_y), char_img)
+            EffectFactory._paste_centered(
+                canvas,
+                char_img,
+                offset_x=offset_x,
+                offset_y=offset_y,
+                scale=scale,
+                alpha=alpha,
+            )
 
             # --- 步骤 5: 应用侧边渐变蒙版 ---
-            # 【修复核心】删除了 "or True"，只有名称匹配才应用蒙版
-            if mode == "简单 Cut-in" and side_mask_arr is not None:
-                r, g, b, a = canvas.split()
-                a_arr = np.array(a).astype(float)
-                
-                # 简单乘法：保留原图透明度 * 侧边蒙版
-                new_a_arr = (a_arr * side_mask_arr) / 255.0
-                
-                final_a = Image.fromarray(new_a_arr.astype(np.uint8))
-                canvas.putalpha(final_a)
+            progress = i / max(1, frames - 1)
+            effect_time = progress * 2.4
+            effect_bounds = EffectFactory._alpha_bounds(canvas)
+            if mode == "简单 Cut-in":
+                canvas = EffectFactory._apply_side_fade(canvas, side_mask_arr)
+            elif mode == "噪声光环":
+                halo = EffectFactory._noise_halo_layer(canvas.size, effect_time, bounds=effect_bounds)
+                canvas = Image.alpha_composite(halo, canvas)
+                canvas = Image.alpha_composite(canvas, EffectFactory._multiply_alpha(halo, 0.55))
+            elif mode == "秘法火光":
+                fire = EffectFactory._arcane_fire_layer(canvas.size, effect_time, bounds=effect_bounds)
+                canvas = Image.alpha_composite(fire, canvas)
+                canvas = Image.alpha_composite(canvas, EffectFactory._multiply_alpha(fire, 0.5))
+            elif mode == "花瓣消散":
+                canvas = EffectFactory._apply_petal_dissolve(canvas, i, frames, bounds=effect_bounds)
             
             results.append(canvas)
 
@@ -253,18 +694,12 @@ class VideoProcessor:
         读取视频 -> 抽帧(跳过首帧) -> 裁剪 -> 强制转RGBA -> 保存
         (已移除 chroma_key_mode 等背景去除参数)
         """
-        try:
-            from moviepy.editor import ImageClip
-            HAS_MOVIEPY = True
-        except Exception as e:
-            HAS_MOVIEPY = False
-            
-        if not HAS_MOVIEPY:
+        VideoFileClip = get_video_file_clip_class()
+
+        if VideoFileClip is None:
             return False, "未安装 MoviePy 库"
 
         try:
-            from moviepy.editor import VideoFileClip
-            
             # 1. 加载视频
             clip = VideoFileClip(video_path)
             duration = clip.duration
@@ -409,13 +844,12 @@ class VideoSettingsDialog(tk.Toplevel):
         ttk.Button(f_right, text="❌ 取消", command=self.destroy).pack(side="bottom")
 
     def load_preview_and_init(self):
-        try:
-            from moviepy.editor import VideoFileClip
-        except ImportError:
+        VideoFileClip = get_video_file_clip_class()
+        if VideoFileClip is None:
+            messagebox.showerror("错误", "处理视频需要安装 moviepy 库！\n请运行对应 venv 的 pip install moviepy")
+            self.destroy()
             return
-        if not HAS_MOVIEPY: return
         try:
-            from moviepy.editor import VideoFileClip
             clip = VideoFileClip(self.video_path)
             frame = clip.get_frame(0) # 第0秒
             clip.close()
@@ -538,6 +972,75 @@ class VideoSettingsDialog(tk.Toplevel):
             self.callback(self.result_data)
         self.destroy()
     
+
+class FrameSequencePreview(tk.Toplevel):
+    def __init__(self, parent, frame_paths):
+        super().__init__(parent)
+        self.title("预处理帧预览")
+        self.frame_paths = frame_paths
+        self.index = 0
+        self.playing = len(frame_paths) > 1
+        self.after_id = None
+        self.tk_img = None
+
+        self.label = ttk.Label(self)
+        self.label.pack(fill="both", expand=True, padx=10, pady=10)
+
+        bottom = ttk.Frame(self, padding=8)
+        bottom.pack(fill="x")
+        self.info = ttk.Label(bottom, text="")
+        self.info.pack(side="left")
+
+        ttk.Button(bottom, text="上一帧", command=self.prev_frame).pack(side="right", padx=3)
+        ttk.Button(bottom, text="下一帧", command=self.next_frame).pack(side="right", padx=3)
+        self.play_btn = ttk.Button(bottom, text="暂停" if self.playing else "播放", command=self.toggle_play)
+        self.play_btn.pack(side="right", padx=3)
+
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.geometry("560x640")
+        self.show_frame()
+        if self.playing:
+            self.schedule_next()
+
+    def show_frame(self):
+        path = self.frame_paths[self.index]
+        img = Image.open(path).convert("RGBA")
+        img.thumbnail((520, 560), Image.Resampling.LANCZOS)
+        self.tk_img = ImageTk.PhotoImage(img)
+        self.label.config(image=self.tk_img)
+        self.info.config(text=f"{self.index + 1}/{len(self.frame_paths)}  {os.path.basename(path)}")
+
+    def schedule_next(self):
+        if self.playing:
+            self.after_id = self.after(80, self.advance)
+
+    def advance(self):
+        self.index = (self.index + 1) % len(self.frame_paths)
+        self.show_frame()
+        self.schedule_next()
+
+    def toggle_play(self):
+        self.playing = not self.playing
+        self.play_btn.config(text="暂停" if self.playing else "播放")
+        if self.playing:
+            self.schedule_next()
+        elif self.after_id:
+            self.after_cancel(self.after_id)
+            self.after_id = None
+
+    def prev_frame(self):
+        self.index = (self.index - 1) % len(self.frame_paths)
+        self.show_frame()
+
+    def next_frame(self):
+        self.index = (self.index + 1) % len(self.frame_paths)
+        self.show_frame()
+
+    def close(self):
+        if self.after_id:
+            self.after_cancel(self.after_id)
+        self.destroy()
+
 
 # =========================================================================
 # PART 4: UI 页面 - BUFF替换 (BK2 生成器) - [已修改]
@@ -940,7 +1443,7 @@ class BuffPage(tk.Frame):
         f_row2 = ttk.Frame(f_job)
         f_row2.pack(fill="x", pady=5)
         ttk.Label(f_row2, text="动态特效:", width=12).pack(side="left")
-        effect_list = ["简单 Cut-in", "无"]
+        effect_list = EffectFactory.available_effects()
         self.cb_effect = ttk.Combobox(f_row2, textvariable=self.effect_mode, values=effect_list, state="readonly")
         self.cb_effect.pack(side="left", fill="x", expand=True)
         self.cb_effect.bind("<<ComboboxSelected>>", self.on_effect_change)
@@ -1111,7 +1614,7 @@ class BuffPage(tk.Frame):
         self.log_text.see("end")
         self.log_text.config(state="disabled")
 
-    # --- 预览功能 (保持不变) ---
+    # --- 预览功能 ---
     def preview_video(self):
         # 1. 确定目标文件
         target_file = self.last_generated_file
@@ -1126,9 +1629,27 @@ class BuffPage(tk.Frame):
                     code = BUFF_DATA[cat][job]
                     target_file = os.path.join(out_dir, f"{code}.bk2")
         
-        # 2. 检查文件是否存在
-        if not target_file or not os.path.exists(target_file):
-            messagebox.showwarning("无法预览", f"找不到生成的 .bk2 文件：\n{target_file}\n\n请先点击[生成]按钮。")
+        preview_kind, preview_target = resolve_preview_target(target_file, self.actual_processed_path)
+
+        if preview_kind == "frames":
+            self.log(f"▶️ 正在预览预处理帧: {len(preview_target)} 张")
+            FrameSequencePreview(self.winfo_toplevel(), preview_target)
+            return
+
+        if preview_kind == "invalid_bink":
+            messagebox.showwarning(
+                "无法预览",
+                f"找到目标文件，但它不是有效的 Bink/BK2 文件：\n{preview_target}\n\n"
+                "请重新点击[生成动态 BK2 视频]，生成成功后再播放 BK2。"
+            )
+            return
+
+        if preview_kind == "missing":
+            messagebox.showwarning(
+                "无法预览",
+                f"找不到可播放的 .bk2，也没有可预览的预处理帧：\n{preview_target}\n\n"
+                "导入 MP4 后请先完成预处理；要播放 BK2，请先点击[生成动态 BK2 视频]。"
+            )
             return
 
         # 3. 寻找播放器
@@ -1143,12 +1664,11 @@ class BuffPage(tk.Frame):
         
         # 4. 执行播放
         try:
-            target_file_abs = os.path.abspath(target_file)
+            target_file_abs = preview_target
             self.log(f"▶️ 正在播放: {os.path.basename(target_file_abs)}")
             
             if real_player:
-                cmd_str = f'"{real_player}" "{target_file_abs}" /L'
-                subprocess.Popen(cmd_str, shell=False)
+                subprocess.Popen([real_player, target_file_abs, "/L"], shell=False)
             else:
                 self.log("⚠️ 未找到专用播放器，尝试使用系统默认方式...")
                 os.startfile(target_file_abs)
@@ -1176,7 +1696,7 @@ class BuffPage(tk.Frame):
         final_bk2_path = os.path.join(out_dir, f"{file_code}.bk2")
         effect = self.effect_mode.get()
         
-        self.last_generated_file = final_bk2_path
+        self.last_generated_file = None
         
         # 传入 real_src_path
         threading.Thread(target=self.run_thread, args=(real_src_path, final_bk2_path, rad, effect)).start()
@@ -1224,9 +1744,13 @@ class BuffPage(tk.Frame):
             
             # 3. 调用 BK2 生成器
             success = build_hidden_bk2(target_folder, dst_path, rad, status_callback=self.log)
-            if success:
+            if success and is_bink_file(dst_path):
+                self.last_generated_file = dst_path
                 messagebox.showinfo("成功", f"生成完毕！\n您可以点击[预览]按钮查看效果。")
                 self.log(">>> ✅ 任务完成")
+            elif success:
+                self.log(">>> ❌ 生成失败: 输出文件不是有效的 Bink/BK2")
+                messagebox.showerror("生成失败", f"输出文件不是有效的 Bink/BK2：\n{dst_path}")
             else:
                 self.log(">>> ❌ 任务失败")
                 
