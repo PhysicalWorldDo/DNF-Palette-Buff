@@ -9,15 +9,22 @@ if APP_DIR not in sys.path:
 
 from main import MainApplication
 
+PAGE_KEY = "buff"
+PAGE_MODULE = "modules.mod_buff"
+
 
 def main() -> None:
+    if "--smoke-import-page" in sys.argv:
+        __import__(PAGE_MODULE)
+        return
+
     app = MainApplication()
     app.title("BUFF 替换")
     try:
         app.sidebar.pack_forget()
     except Exception:
         pass
-    app.show_page("buff")
+    app.show_page(PAGE_KEY)
     app.mainloop()
 
 
