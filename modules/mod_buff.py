@@ -4,6 +4,7 @@ import threading
 import subprocess
 import shutil
 import glob
+import tempfile
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, colorchooser
 from io import BytesIO
@@ -126,6 +127,37 @@ def resolve_preview_target(generated_file, processed_path):
 
 
 # --- 核心构建函数 ---
+def _is_ascii_path(path):
+    try:
+        os.fspath(path).encode("ascii")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+def _create_rad_ascii_workspace(tool_path):
+    drive, _ = os.path.splitdrive(os.path.abspath(tool_path))
+    candidates = []
+    if drive:
+        candidates.append(os.path.join(drive + os.sep, "DNFPaletteBuffRadTemp"))
+    candidates.extend([
+        r"C:\DNFPaletteBuffRadTemp",
+        os.path.join(tempfile.gettempdir(), "DNFPaletteBuffRadTemp"),
+    ])
+
+    last_error = None
+    for base in candidates:
+        if not _is_ascii_path(base):
+            continue
+        try:
+            os.makedirs(base, exist_ok=True)
+            return tempfile.mkdtemp(prefix="rad_", dir=base)
+        except OSError as exc:
+            last_error = exc
+
+    raise OSError(f"无法创建 RAD 专用 ASCII 临时目录: {last_error}")
+
+
 def build_hidden_bk2(image_folder, output_bk2, tool_path, status_callback=None):
     def log(msg):
         if status_callback: status_callback(msg)
@@ -164,46 +196,53 @@ def build_hidden_bk2(image_folder, output_bk2, tool_path, status_callback=None):
     pngs = glob.glob(os.path.join(image_folder, "frame_*.png"))
     pngs.sort()
 
-    # 生成 List 文件
-    list_file_path = os.path.join(image_folder, "files.lst")
+    # RAD 对中文路径支持不稳定；所有输入序列、列表文件和临时输出都放到 ASCII 工作目录。
+    rad_workspace = _create_rad_ascii_workspace(tool_path)
+    staged_pngs = []
     try:
-        with open(list_file_path, "w", encoding="mbcs") as f:
-            for img in pngs: f.write(os.path.abspath(img) + "\n")
-    except:
-        with open(list_file_path, "w", encoding="utf-8") as f:
-            for img in pngs: f.write(os.path.abspath(img) + "\n")
+        for index, img in enumerate(pngs):
+            staged_path = os.path.join(rad_workspace, f"frame_{index:04d}.png")
+            shutil.copy2(os.path.abspath(img), staged_path)
+            staged_pngs.append(staged_path)
 
-    # 构造命令
-    tool_name = os.path.basename(tool_path).lower()
-    tool_dir = os.path.dirname(tool_path)
-    cmd = [tool_path]
-    if "radvideo" in tool_name:
-        cmd.append("binkc")
-        
-    cmd.append(list_file_path)
-    cmd.append(output_bk2)
-    
-    # 【修改点2】参数调整
-    cmd.append("/Z3000")   # 告诉它处理Alpha (DNF需要)
-    #cmd.append("/Z10000")  # 【关键】禁止弹出"没有Alpha"的警告，没有就强制按没有处理
-    cmd.append("/O")       # 覆盖
-    cmd.append("/#")       # 静默退出
+        list_file_path = os.path.join(rad_workspace, "files.lst")
+        with open(list_file_path, "w", encoding="ascii") as f:
+            for img in staged_pngs:
+                f.write(os.path.abspath(img) + "\n")
 
-    debug_cmd_str = " ".join([f'"{x}"' if " " in x else x for x in cmd])
-    log(f"🚀 正在执行...")
-    
-    startupinfo = None
-    if os.name == 'nt':
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startupinfo.wShowWindow = subprocess.SW_HIDE
+        temp_output_bk2 = os.path.join(rad_workspace, "output.bk2")
 
-    try:
+        # 构造命令
+        tool_name = os.path.basename(tool_path).lower()
+        tool_dir = os.path.dirname(tool_path)
+        cmd = [tool_path]
+        if "radvideo" in tool_name:
+            cmd.append("binkc")
+
+        cmd.append(list_file_path)
+        cmd.append(temp_output_bk2)
+
+        # 【修改点2】参数调整
+        cmd.append("/Z3000")   # 告诉它处理Alpha (DNF需要)
+        #cmd.append("/Z10000")  # 【关键】禁止弹出"没有Alpha"的警告，没有就强制按没有处理
+        cmd.append("/O")       # 覆盖
+        cmd.append("/#")       # 静默退出
+
+        debug_cmd_str = " ".join([f'"{x}"' if " " in x else x for x in cmd])
+        log(f"🚀 正在执行...")
+
+        startupinfo = None
+        if os.name == 'nt':
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+
         result = subprocess.run(cmd, capture_output=True, text=True, startupinfo=startupinfo, cwd=tool_dir or None)
 
-        if os.path.exists(output_bk2) and os.path.getsize(output_bk2) > 1024:
+        if os.path.exists(temp_output_bk2) and os.path.getsize(temp_output_bk2) > 1024:
+            os.makedirs(os.path.dirname(output_bk2), exist_ok=True)
+            shutil.copy2(temp_output_bk2, output_bk2)
             log(f"✅ 成功！视频已生成")
-            if os.path.exists(list_file_path): os.remove(list_file_path)
             return True
         else:
             log(f"❌ 生成失败。")
@@ -215,6 +254,11 @@ def build_hidden_bk2(image_folder, output_bk2, tool_path, status_callback=None):
     except Exception as e:
         log(f"❌ 异常: {e}")
         return False
+    finally:
+        try:
+            shutil.rmtree(rad_workspace, ignore_errors=True)
+        except Exception:
+            pass
         
         
 class EffectFactory:
