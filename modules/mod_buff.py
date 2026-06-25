@@ -158,6 +158,21 @@ def _create_rad_ascii_workspace(tool_path):
     raise OSError(f"无法创建 RAD 专用 ASCII 临时目录: {last_error}")
 
 
+def stage_bink_for_preview(source_bk2, tool_path):
+    source_bk2 = os.path.abspath(source_bk2)
+    if _is_ascii_path(source_bk2):
+        return source_bk2, None
+
+    workspace = _create_rad_ascii_workspace(tool_path)
+    safe_name = os.path.basename(source_bk2) or "preview.bk2"
+    if not _is_ascii_path(safe_name):
+        safe_name = "preview.bk2"
+
+    staged_bk2 = os.path.join(workspace, safe_name)
+    shutil.copy2(source_bk2, staged_bk2)
+    return staged_bk2, workspace
+
+
 def build_hidden_bk2(image_folder, output_bk2, tool_path, status_callback=None):
     def log(msg):
         if status_callback: status_callback(msg)
@@ -217,7 +232,7 @@ def build_hidden_bk2(image_folder, output_bk2, tool_path, status_callback=None):
         tool_dir = os.path.dirname(tool_path)
         cmd = [tool_path]
         if "radvideo" in tool_name:
-            cmd.append("binkc")
+            cmd.append("bink")
 
         cmd.append(list_file_path)
         cmd.append(temp_output_bk2)
@@ -1471,6 +1486,7 @@ class BuffPage(tk.Frame):
         
         self.last_generated_file = None 
         self.temp_video_path = None
+        self.preview_temp_dirs = []
         
         self.selected_category = tk.StringVar(value=Config.get("buff_category", ""))
         self.selected_job_name = tk.StringVar(value=Config.get("buff_job", ""))
@@ -1490,6 +1506,21 @@ class BuffPage(tk.Frame):
         
         # 绑定输入框变化事件：如果用户手动修改了路径，必须清空影子变量，防止逻辑错乱
         self.input_path.trace("w", self.on_input_changed)
+
+    def _remember_preview_temp_dir(self, temp_dir):
+        if not temp_dir:
+            return
+
+        self.preview_temp_dirs.append(temp_dir)
+        while len(self.preview_temp_dirs) > 8:
+            old_dir = self.preview_temp_dirs.pop(0)
+            shutil.rmtree(old_dir, ignore_errors=True)
+
+    def destroy(self):
+        for temp_dir in self.preview_temp_dirs:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        self.preview_temp_dirs.clear()
+        super().destroy()
 
     def create_widgets(self):
         tk.Label(self, text="BUFF替换", font=("微软雅黑", 16, "bold"), fg="#333").pack(pady=20)
@@ -1752,17 +1783,30 @@ class BuffPage(tk.Frame):
                 break
         
         # 4. 执行播放
+        preview_temp_dir = None
         try:
-            target_file_abs = preview_target
-            self.log(f"▶️ 正在播放: {os.path.basename(target_file_abs)}")
+            target_file_abs, preview_temp_dir = stage_bink_for_preview(
+                preview_target,
+                real_player or self.rad_path.get()
+            )
+            self._remember_preview_temp_dir(preview_temp_dir)
+            self.log(f"▶️ 正在播放: {os.path.basename(preview_target)}")
             
             if real_player:
-                subprocess.Popen([real_player, target_file_abs, "/L"], shell=False)
+                subprocess.Popen(
+                    [real_player, target_file_abs, "/L"],
+                    shell=False,
+                    cwd=os.path.dirname(real_player) or None
+                )
             else:
                 self.log("⚠️ 未找到专用播放器，尝试使用系统默认方式...")
                 os.startfile(target_file_abs)
                 
         except Exception as e:
+            if preview_temp_dir:
+                shutil.rmtree(preview_temp_dir, ignore_errors=True)
+                if preview_temp_dir in self.preview_temp_dirs:
+                    self.preview_temp_dirs.remove(preview_temp_dir)
             messagebox.showerror("启动失败", f"无法预览。\n错误信息: {e}")
 
     def start_build(self):

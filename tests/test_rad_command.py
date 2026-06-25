@@ -17,7 +17,7 @@ class RadCommandTest(unittest.TestCase):
         except UnicodeEncodeError as exc:
             raise AssertionError(f"path is not ASCII: {path}") from exc
 
-    def test_radvideo_uses_binkc_compressor_command(self):
+    def test_radvideo_uses_legacy_bink_compressor_command(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             frames = root / "frames"
@@ -37,7 +37,7 @@ class RadCommandTest(unittest.TestCase):
             with patch("builtins.print"), patch("modules.mod_buff.subprocess.run", side_effect=fake_run):
                 self.assertTrue(build_hidden_bk2(str(frames), str(output), str(rad)))
 
-            self.assertEqual(captured["cmd"][1], "binkc")
+            self.assertEqual(captured["cmd"][1], "bink")
             self.assertEqual(Path(captured["cmd"][2]).name, "files.lst")
             self.assertEqual(Path(captured["cmd"][3]).name, "output.bk2")
             self.assertEqual(captured["kwargs"]["cwd"], str(rad.parent.resolve()))
