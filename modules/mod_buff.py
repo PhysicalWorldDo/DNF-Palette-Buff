@@ -175,9 +175,10 @@ def build_hidden_bk2(image_folder, output_bk2, tool_path, status_callback=None):
 
     # 构造命令
     tool_name = os.path.basename(tool_path).lower()
+    tool_dir = os.path.dirname(tool_path)
     cmd = [tool_path]
     if "radvideo" in tool_name:
-        cmd.append("bink")
+        cmd.append("binkc")
         
     cmd.append(list_file_path)
     cmd.append(output_bk2)
@@ -198,7 +199,7 @@ def build_hidden_bk2(image_folder, output_bk2, tool_path, status_callback=None):
         startupinfo.wShowWindow = subprocess.SW_HIDE
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, startupinfo=startupinfo)
+        result = subprocess.run(cmd, capture_output=True, text=True, startupinfo=startupinfo, cwd=tool_dir or None)
 
         if os.path.exists(output_bk2) and os.path.getsize(output_bk2) > 1024:
             log(f"✅ 成功！视频已生成")
@@ -206,7 +207,7 @@ def build_hidden_bk2(image_folder, output_bk2, tool_path, status_callback=None):
             return True
         else:
             log(f"❌ 生成失败。")
-            error_msg = f"RAD工具执行失败。\n手动命令：\n{debug_cmd_str}\n\n输出: {result.stdout} {result.stderr}"
+            error_msg = f"RAD工具执行失败。\n工作目录：\n{tool_dir}\n\n手动命令：\n{debug_cmd_str}\n\n输出: {result.stdout} {result.stderr}"
             print(error_msg)
             messagebox.showerror("生成失败", error_msg) 
             return False
